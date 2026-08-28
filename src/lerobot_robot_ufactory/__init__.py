@@ -6,6 +6,7 @@ import lerobot_robot_ufactory.robots.uf_robot
 import lerobot_robot_ufactory.robots.uf_mock_robot
 import lerobot_robot_ufactory.teleoperators.uf_mock_teleop
 import lerobot_robot_ufactory.teleoperators.gello_teleop
+import lerobot_robot_ufactory.teleoperators.webxr_teleop
 import lerobot_robot_ufactory.teleoperators.pika_teleop
 import lerobot_robot_ufactory.teleoperators.space_mouse
 import lerobot_robot_ufactory.teleoperators.umi_teleop

@@ -33,6 +33,9 @@ class TeleopConfig:
     robot: RobotConfig
     teleop: TeleoperatorConfig
     fps: int = 30
+    # True이면 UFACTORY 원본처럼 Space 입력 전까지 일시정지합니다.
+    # run.sh처럼 별도의 시작 확인 절차가 있는 경우에만 False로 설정합니다.
+    start_paused: bool = True
 
     def __post_init__(self):
         if hasattr(self.robot, 'robots'):
@@ -62,7 +65,7 @@ def teleop_loop(cfg: TeleopConfig):
     is_uf_teleop = isinstance(teleop, UFBaseTeleop)
 
     is_reset = False
-    is_paused = True
+    is_paused = cfg.start_paused
     events = {"exit": False}
     listener = None
     key_dict = {}
@@ -104,10 +107,19 @@ def teleop_loop(cfg: TeleopConfig):
                 key_dict[key] = False
 
         listener, events = init_keyboard_listener(events=events, on_press=on_press, on_release=on_release)
+        if not is_paused and is_uf_teleop:
+        # run.sh의 start 확인과 3초 안전 대기를 이미 통과했습니다.
+            # 현재 로봇 자세를 기준으로 텔레옵을 활성화합니다.
+            obs = robot.get_observation()
+            teleop.set_teleop_enabled(True, obs)
         print("\n********** Teleop Control Loop Start **********")
-        print('⌨   [ESC] Exit  [Space] Start  [←] Reset')
+        if is_paused:
+            print('⌨   [ESC] Exit  [Space] Start  [←] Reset')
+        else:
+            print('✅ 텔레옵 자동 시작 완료  [Space] Pause  [ESC] Exit  [←] Reset')
     else:
-        input('⌨   Press Enter to start teleop >>> ')
+        if is_paused:
+            input('⌨   Press Enter to start teleop >>> ')
         if is_uf_teleop:
             obs = robot.get_observation()
             teleop.set_teleop_enabled(True, obs)
@@ -159,6 +171,10 @@ def teleop_loop(cfg: TeleopConfig):
 
         # Get robot observation
         obs = robot.get_observation()
+        # WebXR uses the current follower pose to hold immediately when its
+        # deadman is released or tracking becomes stale.
+        if hasattr(teleop, "update_observation"):
+            teleop.update_observation(obs)
 
         act = teleop.get_action()
         act_processed_teleop = teleop_action_processor((act, obs))

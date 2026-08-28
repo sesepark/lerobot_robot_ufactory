@@ -16,8 +16,6 @@ from xarm.wrapper import XArmAPI
 from xarm.core.utils import convert
 
 ## Configurations:
-INIT_SYNC_JOINT_VELOCITY_RAD = 0.2
-
 CARTESIAN_OBS_KEYS = [
     "pose.x", "pose.y", "pose.z", "pose.rx", "pose.ry", "pose.rz",
     # un-comment if you need more features below:
@@ -27,6 +25,11 @@ CARTESIAN_OBS_KEYS = [
 CARTESIAN_ACTION_KEYS = [
     "pose.x", "pose.y", "pose.z", "pose.rx", "pose.ry", "pose.rz",
 ]
+
+# 현재 관절각과 시작 관절각의 차이가 이 값보다 작으면, 실제로 움직일 필요가
+# 없는 동일 자세로 판단합니다. 동일 목표에 wait=True를 사용하면 일부 xArm
+# 펌웨어/SDK 조합에서 완료 신호를 기다리며 멈출 수 있으므로 명령을 생략합니다.
+START_POSE_NOOP_TOLERANCE_RAD = math.radians(0.01)
 
 class GripperType(IntEnum):
     NoGripper = 0
@@ -89,6 +92,17 @@ class UFRobot(Robot, Thread):
 
         self._max_joint_velocity = math.radians(self.config.max_joint_velocity)
         self._max_linear_velocity = self.config.max_linear_velocity
+        if self.config.initial_sync_duration_s < 0:
+            raise ValueError("initial_sync_duration_s는 0 이상이어야 합니다.")
+        if self.config.initial_sync_joint_velocity <= 0:
+            raise ValueError("initial_sync_joint_velocity는 0보다 커야 합니다.")
+        self._initial_sync_duration_s = self.config.initial_sync_duration_s
+        self._initial_sync_joint_velocity = math.radians(self.config.initial_sync_joint_velocity)
+        # 첫 실제 텔레옵 명령의 시각이다. 명령 횟수가 아니라 실제 경과 시간으로
+        # 초기 저속 구간을 관리해야 컴퓨터 부하/FPS 변화에도 3초가 유지된다.
+        self._first_teleop_action_time = None
+        self._initial_sync_finished_reported = False
+        self._last_dropped_error_code = 0
 
         if self.config.start_tcp_pose and len(self.config.start_tcp_pose) >= 6:
             self._start_tcp_pose = list(self.config.start_tcp_pose[:3]) + list(map(math.radians, self.config.start_tcp_pose[3:6]))
@@ -145,7 +159,12 @@ class UFRobot(Robot, Thread):
             if self._gripper_type > GripperType.NoGripper:
                 state_features.update({f"{self.prefix}gripper.pos": float})
         elif self._control_space == "cartesian":
-            state_features = {f"{self.prefix}{key}": float for key in CARTESIAN_OBS_KEYS}
+            state_features = {}
+            # endpoint 녹화용: 실제 관절값을 pose보다 앞에 둔다. 데이터 병합 시
+            # state[0:7]=관절, state[7:13]=pose, state[13]=gripper 순서를 전제한다.
+            if self.config.cartesian_obs_include_joints:
+                state_features.update({f"{self.prefix}J{motor}.pos": float for motor in range(1, self._dof+1)})
+            state_features.update({f"{self.prefix}{key}": float for key in CARTESIAN_OBS_KEYS})
             if self._gripper_type > GripperType.NoGripper:
                 state_features.update({f"{self.prefix}gripper.pos": float})
         else:
@@ -181,6 +200,7 @@ class UFRobot(Robot, Thread):
         return action_ft
 
     def connect(self, calibrate: bool = True) -> None:
+        print("[xArm 연결] 컨트롤러 연결을 시작합니다.", flush=True)
         self.real_arm = XArmAPI(self.config.robot_ip)
         time.sleep(0.2)
         self._is_connected = self.real_arm.connected
@@ -201,6 +221,7 @@ class UFRobot(Robot, Thread):
             print("Could not connect to the cameras, check that all cameras are plugged-in.")
             raise ConnectionError()
 
+        print("[xArm 연결] 하드웨어 연결 완료, 안전 시작 설정을 적용합니다.", flush=True)
         # if self._gripper_type == GripperType.PikaGripper:
         #     if not self.pika_gripper.connect():
         #         print('Could not connect to pika gripper.')
@@ -213,8 +234,24 @@ class UFRobot(Robot, Thread):
         self.real_arm.set_linear_spd_limit_factor(2.0)
 
         self._is_connected = True
+        print("[xArm 연결 완료] 텔레옵 명령을 받을 준비가 됐습니다.", flush=True)
 
-    def configure(self) -> None:
+    def configure(self, alignment_velocity_deg_s: float | None = None) -> None:
+        # configure()는 텔레옵 시작뿐 아니라 녹화의 매 에피소드 시작 시에도 호출된다.
+        # 따라서 새 에피소드의 첫 실제 명령부터 다시 저속 구간이 적용돼야 한다.
+        self._first_teleop_action_time = None
+        self._initial_sync_finished_reported = False
+        self._last_dropped_error_code = 0
+        # 기본값은 텔레옵 시작 안전 속도다. 기록 에피소드 저장 직후의 자동 복귀처럼
+        # 명시적으로 요청한 경우에만 별도 관절 정렬 속도를 쓴다.
+        alignment_velocity_deg_s = (
+            self.config.initial_sync_joint_velocity
+            if alignment_velocity_deg_s is None
+            else alignment_velocity_deg_s
+        )
+        if not 0 < alignment_velocity_deg_s <= 10:
+            raise ValueError("초기 자세 정렬 속도는 0보다 크고 10°/s 이하여야 합니다.")
+        alignment_velocity_rad_s = math.radians(alignment_velocity_deg_s)
         self.real_arm.motion_enable()
         self.real_arm.clean_error()
         self.real_arm.set_mode(0)  # set to idle mode
@@ -258,7 +295,40 @@ class UFRobot(Robot, Thread):
                 raise RuntimeError(f"Failed to set correct state to Gripper! Controller Error code: {err_warn[0]} !")
         
         if self._start_joints is not None:
-            self.real_arm.set_servo_angle(angle=self._start_joints, is_radian=True, wait=True)
+            code, current_joints = self.real_arm.get_servo_angle(is_radian=True)
+            if code != 0:
+                raise RuntimeError(f"시작 자세 확인 실패: xArm SDK 반환 코드 {code}")
+            largest_error_rad = max(
+                abs(current - target)
+                for current, target in zip(current_joints[:self._dof], self._start_joints[:self._dof])
+            )
+            if largest_error_rad <= START_POSE_NOOP_TOLERANCE_RAD:
+                print(
+                    "[시작 자세] 이미 기록된 안전 시작 자세와 일치하여 "
+                    "불필요한 wait=True 이동 명령을 생략합니다.",
+                    flush=True,
+                )
+            else:
+                # run.sh의 2° 사전 검증을 통과한 작은 오차를 저속으로 맞춥니다.
+                # 필요한 이동 시간에 5초 여유를 더해 무한 대기를 방지합니다.
+                alignment_timeout_s = max(
+                    10.0,
+                    largest_error_rad / alignment_velocity_rad_s + 5.0,
+                )
+                print(
+                    f"[시작 자세] 최대 {math.degrees(largest_error_rad):.3f}° 오차를 "
+                    f"{alignment_velocity_deg_s:.1f}°/s로 맞춥니다.",
+                    flush=True,
+                )
+                code = self.real_arm.set_servo_angle(
+                    angle=self._start_joints,
+                    speed=alignment_velocity_rad_s,
+                    is_radian=True,
+                    wait=True,
+                    timeout=alignment_timeout_s,
+                )
+                if code != 0:
+                    raise RuntimeError(f"안전 시작 자세 정렬 실패: xArm SDK 반환 코드 {code}")
         if self._start_tcp_pose is not None:
             self.real_arm.set_position(*self._start_tcp_pose, speed=100, is_radian=True, wait=True)
             _, self._start_joints = self.real_arm.get_servo_angle(is_radian=True)
@@ -304,12 +374,21 @@ class UFRobot(Robot, Thread):
             with self._update_lock:
                 pos_list = self.rt_actual_tcp_pose.copy()
                 vel_list = self.rt_actual_tcp_speed.copy()
+                jpos_fbk_list = self.rt_actual_joint_pos.copy()
                 # pos_cmd_list = self.rt_cmd_tcp_pose.copy()
                 # vel_cmd_list = self.rt_cmd_tcp_vel.copy()
-                # jpos_fbk_list = self.rt_actual_joint_pos.copy()
                 # jvel_fbk_list = self.rt_actual_joint_speed.copy()
 
-            obs_dict = {f"{self.prefix}pose.x": pos_list[0], f"{self.prefix}pose.y": pos_list[1], f"{self.prefix}pose.z": pos_list[2], f"{self.prefix}pose.rx": pos_list[3], f"{self.prefix}pose.ry": pos_list[4], f"{self.prefix}pose.rz": pos_list[5]}
+            obs_dict = {}
+            if self.config.cartesian_obs_include_joints:
+                # RT report 관절값은 라디안이다. 도 단위가 섞이면 즉시 중단해
+                # 잘못된 단위의 데이터가 저장되는 것을 막는다.
+                if any(abs(value) > 7.0 for value in jpos_fbk_list[:self._dof]):
+                    raise RuntimeError(
+                        f"RT report 관절값이 라디안 범위를 벗어났습니다: {jpos_fbk_list[:self._dof]}"
+                    )
+                obs_dict.update({f"{self.prefix}J{k+1}.pos": jpos_fbk_list[k] for k in range(self._dof)})
+            obs_dict.update({f"{self.prefix}pose.x": pos_list[0], f"{self.prefix}pose.y": pos_list[1], f"{self.prefix}pose.z": pos_list[2], f"{self.prefix}pose.rx": pos_list[3], f"{self.prefix}pose.ry": pos_list[4], f"{self.prefix}pose.rz": pos_list[5]})
             if self._cart_obs_has_vel:
                 obs_dict.update({f"{self.prefix}velo.x": vel_list[0], f"{self.prefix}velo.y": vel_list[1], f"{self.prefix}velo.z": vel_list[2], f"{self.prefix}velo.rx": vel_list[3], f"{self.prefix}velo.ry": vel_list[4], f"{self.prefix}velo.rz": vel_list[5]})
         else:
@@ -354,37 +433,104 @@ class UFRobot(Robot, Thread):
         if not self._is_connected:
             raise ConnectionError()
         if self.real_arm.error_code != 0:
+            # 오류 상태에서는 액션을 조용히 버리는 대신, 같은 오류당 한 번만
+            # 화면에 알려 사용자가 즉시 복구 절차를 선택할 수 있게 한다.
+            if self.real_arm.error_code != self._last_dropped_error_code:
+                self._last_dropped_error_code = self.real_arm.error_code
+                print(
+                    f"⚠️ [xArm 오류 C{self.real_arm.error_code}] 컨트롤러 오류 상태라 "
+                    "텔레옵/녹화 액션을 로봇에 보내지 않습니다. 현재 모드를 중지하고 "
+                    "복구 절차(C31/C19 등)를 실행하세요.",
+                    flush=True,
+                )
             return action
         if self.config.no_action:
             return action
 
         before_write_t = time.perf_counter()
         if self._control_space == "joint":
-            # first sync with gello or other control device SLOWLY!
-            jnt_spd = INIT_SYNC_JOINT_VELOCITY_RAD if self._cmd_cnt < 20 else self._max_joint_velocity
-            wait_ = True if self._cmd_cnt == 0 else False
+            # 시작 직후 3초는 낮은 속도로만 움직인다. 여기서는 목표값 자체를
+            # 잘라내지 않으므로, 사용자가 요청한 자연스러운 GELLO 추종은 유지된다.
+            now = time.monotonic()
+            if self._first_teleop_action_time is None:
+                self._first_teleop_action_time = now
+                print(
+                    f"[안전 시작] 처음 {self._initial_sync_duration_s:.1f}초 동안 "
+                    f"관절 속도를 {self.config.initial_sync_joint_velocity:.1f}°/s로 제한합니다.",
+                    flush=True,
+                )
+            elapsed_s = now - self._first_teleop_action_time
+            initial_sync_active = elapsed_s < self._initial_sync_duration_s
+            jnt_spd = self._initial_sync_joint_velocity if initial_sync_active else self._max_joint_velocity
+            if not initial_sync_active and not self._initial_sync_finished_reported:
+                print(
+                    f"[안전 시작 완료] 정상 관절 속도 "
+                    f"{self.config.max_joint_velocity:.1f}°/s로 전환합니다.",
+                    flush=True,
+                )
+                self._initial_sync_finished_reported = True
 
             cmd_list = [0]*(self._dof)
             for i in range(self._dof):
                 cmd_list[i] = action[f"{self.prefix}J{i+1}.pos"]
 
-            # TODO: make mode 6 compatible with wait=True
-            if wait_== False and self.real_arm.mode != 6:
-                self.real_arm.set_mode(6)
-                self.real_arm.set_state(0)
-                time.sleep(0.1)
-            elif wait_ and self.real_arm.mode != 0:
-                self.real_arm.set_mode(0)
-                self.real_arm.set_state(0)
+            # mode 6은 xArm의 관절 온라인 궤적 계획 모드입니다. 텔레옵 목표를
+            # 계속 갱신해야 하므로 첫 프레임부터 wait=False로 전송합니다.
+            if self.real_arm.mode != 6:
+                code = self.real_arm.set_mode(6)
+                if code != 0:
+                    raise RuntimeError(f"xArm mode 6 설정 실패: SDK 반환 코드 {code}")
+                code = self.real_arm.set_state(0)
+                if code != 0:
+                    raise RuntimeError(f"xArm 동작 상태 설정 실패: SDK 반환 코드 {code}")
                 time.sleep(0.1)
 
-            self.real_arm.set_servo_angle(angle=cmd_list[:self._dof], speed=jnt_spd, is_radian=True, wait=wait_)
+            code = self.real_arm.set_servo_angle(
+                angle=cmd_list[:self._dof],
+                speed=jnt_spd,
+                is_radian=True,
+                wait=False,
+            )
+            if code != 0:
+                raise RuntimeError(f"xArm 텔레옵 관절 명령 실패: SDK 반환 코드 {code}")
         elif self._control_space == "cartesian": # unit: mm?
-            lin_spd = self._max_linear_velocity
+            # joint 모드와 동일하게, 시작 직후 initial_sync_duration_s 동안은
+            # 저속 linear 속도로만 추종한다. 목표 pose 자체는 잘라내지 않는다.
+            now = time.monotonic()
+            if self._first_teleop_action_time is None:
+                self._first_teleop_action_time = now
+                print(
+                    f"[안전 시작] 처음 {self._initial_sync_duration_s:.1f}초 동안 "
+                    f"TCP 속도를 {self.config.initial_sync_linear_velocity:.1f}mm/s로 제한합니다.",
+                    flush=True,
+                )
+            elapsed_s = now - self._first_teleop_action_time
+            initial_sync_active = elapsed_s < self._initial_sync_duration_s
+            lin_spd = (
+                self.config.initial_sync_linear_velocity
+                if initial_sync_active
+                else self._max_linear_velocity
+            )
+            if not initial_sync_active and not self._initial_sync_finished_reported:
+                print(
+                    f"[안전 시작 완료] 정상 TCP 속도 {self._max_linear_velocity:.1f}mm/s로 전환합니다.",
+                    flush=True,
+                )
+                self._initial_sync_finished_reported = True
 
             if not self._rt_report_normal:
                 raise ConnectionError("RT Report for target robot NOT READY! ")
             cmd_list = [action[f"{self.prefix}pose.x"], action[f"{self.prefix}pose.y"], action[f"{self.prefix}pose.z"], action[f"{self.prefix}pose.rx"], action[f"{self.prefix}pose.ry"], action[f"{self.prefix}pose.rz"]]
+            # mode 7은 xArm의 온라인 Cartesian 궤적 계획 모드다. joint 분기의
+            # mode 6 재설정과 동일하게, 끊긴 경우 복구한 뒤 전송한다.
+            if self.real_arm.mode != 7:
+                code = self.real_arm.set_mode(7)
+                if code != 0:
+                    raise RuntimeError(f"xArm mode 7 설정 실패: SDK 반환 코드 {code}")
+                code = self.real_arm.set_state(0)
+                if code != 0:
+                    raise RuntimeError(f"xArm 동작 상태 설정 실패: SDK 반환 코드 {code}")
+                time.sleep(0.1)
             self.real_arm.set_position_aa(axis_angle_pose=cmd_list, speed=lin_spd, is_radian=True, wait=False)
             # self.real_arm.set_position(*cmd_list, radius=0, speed=lin_spd, is_radian=True, wait=False)
 

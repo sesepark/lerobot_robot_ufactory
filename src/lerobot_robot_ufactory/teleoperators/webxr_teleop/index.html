@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <title>xArm7 WebXR Teleop</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    * { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+    body { margin: 0; min-height: 100dvh; background: #080b10; color: #f5f7fa; }
+    #overlay { min-height: 100dvh; display: flex; flex-direction: column; padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    .status { padding: 10px 12px; border-radius: 10px; background: #242b35; margin-bottom: 8px; font-size: 14px; }
+    .ok { background: #123a28; }
+    .bad { background: #4a1717; }
+    .help { color: #c7ced8; line-height: 1.45; font-size: 14px; }
+    .spacer { flex: 1; min-height: 24px; }
+    .controls { display: grid; grid-template-columns: 1fr 1.6fr; gap: 12px; }
+    button { min-height: 76px; border: 0; border-radius: 16px; color: white; background: #344052; font-size: 18px; font-weight: 700; touch-action: none; }
+    button:disabled { opacity: .45; }
+    #gripper.closed { background: #765516; }
+    #move { background: #1c6b43; }
+    #move.active { background: #d04438; transform: scale(.98); }
+    #start { width: 100%; margin-top: 12px; background: #245fa5; }
+    #exit { min-height: 48px; margin-top: 12px; background: #4b2730; display: none; }
+    #details { margin-top: 10px; color: #aab4c2; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <main id="overlay">
+    <h1>xArm7 WebXR Teleop</h1>
+    <div id="network" class="status bad">Server: connecting…</div>
+    <div id="tracking" class="status">WebXR: not started</div>
+    <p class="help">
+      Keep <b>MOVE</b> released while starting. Hold MOVE and move the phone to move the robot.
+      Release MOVE to stop and clutch/reposition the phone. Gripper is a toggle.
+    </p>
+    <button id="start" disabled>START WEBXR</button>
+    <div class="spacer"></div>
+    <section class="controls">
+      <button id="gripper" disabled>GRIPPER OPEN</button>
+      <button id="move" disabled>HOLD TO MOVE</button>
+    </section>
+    <button id="exit">EXIT WEBXR</button>
+    <div id="details"></div>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const token = params.get('token') || '';
+    const network = document.querySelector('#network');
+    const tracking = document.querySelector('#tracking');
+    const details = document.querySelector('#details');
+    const startButton = document.querySelector('#start');
+    const moveButton = document.querySelector('#move');
+    const gripperButton = document.querySelector('#gripper');
+    const exitButton = document.querySelector('#exit');
+
+    let socket = null;
+    let session = null;
+    let referenceSpace = null;
+    let moving = false;
+    let gripperClosed = false;
+    let sequence = 0;
+    let lastSendMs = 0;
+    let frameCount = 0;
+    let fps = 0;
+    let fpsStartMs = performance.now();
+
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+      || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const helloXRUrl = 'https://apps.apple.com/app/helloxr/id6757726359';
+
+    function webXRMissingMessage() {
+      if (isIOS) {
+        return `iPhone Safari has no WebXR. Open this same URL in HelloXR: ${helloXRUrl}`;
+      }
+      return 'This browser does not expose navigator.xr';
+    }
+
+    function setNetwork(text, ok) {
+      network.textContent = `Server: ${text}`;
+      network.className = `status ${ok ? 'ok' : 'bad'}`;
+      startButton.disabled = !ok;
+    }
+
+    function connect() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      socket = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`);
+      socket.onopen = () => setNetwork('connected', true);
+      socket.onclose = event => {
+        setNetwork(`disconnected (${event.code})`, false);
+        moving = false;
+        moveButton.classList.remove('active');
+        setTimeout(connect, 1500);
+      };
+      socket.onerror = () => setNetwork('error', false);
+    }
+
+    function sendPose(transform) {
+      if (!socket || socket.readyState !== WebSocket.OPEN || !transform) return;
+      socket.send(JSON.stringify({
+        type: 'pose',
+        data: {
+          sequence: ++sequence,
+          position: {
+            x: transform.position.x,
+            y: transform.position.y,
+            z: transform.position.z,
+          },
+          orientation: {
+            x: transform.orientation.x,
+            y: transform.orientation.y,
+            z: transform.orientation.z,
+            w: transform.orientation.w,
+          },
+          move: moving,
+          gripper: gripperClosed ? 'close' : 'open',
+          fps,
+          clientTimeMs: performance.now(),
+        }
+      }));
+    }
+
+    function releaseMove() {
+      moving = false;
+      moveButton.classList.remove('active');
+      moveButton.textContent = 'HOLD TO MOVE';
+    }
+
+    moveButton.addEventListener('pointerdown', event => {
+      if (!session) return;
+      event.preventDefault();
+      moveButton.setPointerCapture(event.pointerId);
+      moving = true;
+      moveButton.classList.add('active');
+      moveButton.textContent = 'MOVING — RELEASE TO STOP';
+    });
+    for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      moveButton.addEventListener(name, releaseMove);
+    }
+    window.addEventListener('blur', releaseMove);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) releaseMove();
+    });
+
+    gripperButton.addEventListener('click', () => {
+      gripperClosed = !gripperClosed;
+      gripperButton.textContent = gripperClosed ? 'GRIPPER CLOSED' : 'GRIPPER OPEN';
+      gripperButton.classList.toggle('closed', gripperClosed);
+    });
+
+    async function onXRFrame(time, frame) {
+      if (!session) return;
+      session.requestAnimationFrame(onXRFrame);
+      frameCount += 1;
+      if (time - fpsStartMs >= 1000) {
+        fps = frameCount * 1000 / (time - fpsStartMs);
+        frameCount = 0;
+        fpsStartMs = time;
+      }
+      const viewerPose = frame.getViewerPose(referenceSpace);
+      if (!viewerPose || !viewerPose.views.length) {
+        tracking.textContent = 'WebXR: tracking lost — MOVE released';
+        tracking.className = 'status bad';
+        releaseMove();
+        return;
+      }
+      tracking.textContent = `WebXR: tracking · ${fps.toFixed(0)} fps`;
+      tracking.className = 'status ok';
+      if (time - lastSendMs >= 30) {
+        lastSendMs = time;
+        sendPose(viewerPose.views[0].transform);
+      }
+      details.textContent = `frames sent: ${sequence}\ndeadman: ${moving ? 'HELD' : 'released'}\ngripper: ${gripperClosed ? 'closed' : 'open'}`;
+    }
+
+    startButton.addEventListener('click', async () => {
+      try {
+        if (!navigator.xr) throw new Error(webXRMissingMessage());
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!supported) {
+          throw new Error(isIOS
+            ? `immersive-ar is unavailable here. Open this URL in HelloXR: ${helloXRUrl}`
+            : 'immersive-ar is not supported on this phone/browser');
+        }
+        session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local-floor', 'dom-overlay'],
+          domOverlay: { root: document.querySelector('#overlay') },
+        });
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl', { alpha: true, antialias: false });
+        if (!gl) throw new Error('WebGL is unavailable');
+        await gl.makeXRCompatible();
+        session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+        referenceSpace = await session.requestReferenceSpace('local-floor');
+        session.addEventListener('end', () => {
+          releaseMove();
+          session = null;
+          referenceSpace = null;
+          tracking.textContent = 'WebXR: ended';
+          tracking.className = 'status';
+          startButton.style.display = 'block';
+          exitButton.style.display = 'none';
+          moveButton.disabled = true;
+          gripperButton.disabled = true;
+        });
+        releaseMove();
+        startButton.style.display = 'none';
+        exitButton.style.display = 'block';
+        moveButton.disabled = false;
+        gripperButton.disabled = false;
+        session.requestAnimationFrame(onXRFrame);
+      } catch (error) {
+        tracking.textContent = `WebXR error: ${error.message}`;
+        tracking.className = 'status bad';
+      }
+    });
+
+    exitButton.addEventListener('click', () => {
+      releaseMove();
+      if (session) session.end();
+    });
+    window.addEventListener('pagehide', releaseMove);
+    connect();
+  </script>
+</body>
+</html>

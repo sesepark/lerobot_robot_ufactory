@@ -1,16 +1,30 @@
 import sys
 import copy
 import time
+import math
 import queue
 import argparse
 import logging
 import shutil
 import threading
 from pathlib import Path
+from dataclasses import dataclass
 import lerobot_robot_ufactory # patch
 from lerobot.scripts.lerobot_record import *
 from lerobot_robot_ufactory.teleoperators.uf_mock_teleop import UFMockTeleop
 from lerobot_robot_ufactory.teleoperators.base_teleop import UFBaseTeleop
+
+
+@dataclass
+class UFRecordConfig(RecordConfig):
+    """UFACTORY 기록에만 필요한 에피소드 시작 안전 대기 설정."""
+
+    # Space를 누른 직후 GELLO 입력을 xArm에 연결하기 전 마지막 확인 시간이다.
+    start_countdown_s: float = 3.0
+    # LeRobotDataset.create()에 실제로 전달할 영상 인코더입니다.
+    video_codec: str = "h264"
+    # 성공 저장 또는 실패 폐기 판정 직후의 자동 초기 자세 복귀 속도입니다.
+    return_to_start_velocity: float = 8.0
 from lerobot_robot_ufactory.utils.utils import init_keyboard_listener
 
 
@@ -286,6 +300,10 @@ def record_loop(
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
+            # WebXR uses the current follower pose to hold immediately when
+            # its deadman is released or tracking becomes stale.
+            if hasattr(teleop, "update_observation"):
+                teleop.update_observation(obs)
             act = teleop.get_action()
 
             # (space mouse) from delta Cartesian cmd to absolute command
@@ -344,7 +362,76 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
-def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
+def episode_start_countdown(seconds: float) -> None:
+    """각 에피소드에서 사람이 작업영역을 확인할 시간을 준다.
+
+    이 함수가 끝날 때까지 teleop.set_teleop_enabled(True)를 호출하지 않으므로,
+    GELLO를 움직여도 xArm에 새 추종 명령이 전달되지 않는다.
+    """
+    seconds = max(0.0, seconds)
+    if seconds == 0:
+        return
+    print(f"[에피소드 안전 대기] {seconds:.0f}초 뒤 녹화를 시작합니다. 사람·물체·케이블을 확인하세요.")
+    end_time = time.monotonic() + seconds
+    last_remaining = None
+    while True:
+        remaining = max(0, int(math.ceil(end_time - time.monotonic())))
+        if remaining != last_remaining and remaining > 0:
+            print(f"[에피소드 안전 대기] {remaining}초...")
+            last_remaining = remaining
+        if remaining == 0:
+            break
+        time.sleep(0.05)
+    print("[에피소드 시작] 이제 GELLO 추종과 데이터 기록을 시작합니다.")
+
+
+def print_record_controls(recording: bool = False) -> None:
+    """초보자도 성공 저장과 실패 폐기를 혼동하지 않도록 항상 같은 안내를 보인다."""
+    if recording:
+        print("⌨   [ESC] 전체 종료  [→] 성공 저장  [←] 실패 폐기")
+    else:
+        print("⌨   [ESC] 전체 종료  [Space] 녹화 시작  [→] 성공 저장  [←] 실패 폐기")
+
+
+def wait_for_episode_decision(events: dict, is_evt: bool) -> None:
+    """시간 만료 뒤에도 자동 저장하지 않고 성공/실패 판정을 기다린다."""
+    print("\n[판정 대기] 이번 시도 녹화가 끝났습니다. 아직 저장하지 않았습니다.")
+    print("           → : 성공으로 저장 / ← : 실패로 폐기 / ESC : 전체 수집 종료")
+    if is_evt:
+        while not (
+            events["save_episode"]
+            or events["rerecord_episode"]
+            or events["stop_recording"]
+        ):
+            time.sleep(0.05)
+        return
+
+    # 화면/키보드 이벤트가 없는 환경에서도 자동 저장은 금지한다.
+    while True:
+        answer = input("성공이면 'save', 실패면 'discard', 종료면 'exit'를 입력하세요: ").strip().lower()
+        if answer == "save":
+            events["save_episode"] = True
+            return
+        if answer == "discard":
+            events["rerecord_episode"] = True
+            return
+        if answer == "exit":
+            events["stop_recording"] = True
+            return
+        print("[안내] save / discard / exit 중 하나를 입력하세요.")
+
+
+def return_to_start_after_decision(robot, cfg: UFRecordConfig, decision: str) -> None:
+    """성공 저장과 실패 폐기 모두 판정 직후 같은 시작 자세로 복귀한다."""
+    print(f"[자동 복귀] {decision} 판정이 끝났습니다. 기본 그리퍼를 열고 초기 자세로 돌아갑니다.")
+    robot.configure(alignment_velocity_deg_s=cfg.return_to_start_velocity)
+    print(
+        f"[자동 복귀 완료] {cfg.return_to_start_velocity:.1f}°/s로 초기 자세 복귀를 완료했습니다. "
+        "다음 물체를 배치한 뒤 Space를 누르세요."
+    )
+
+
+def record(cfg: UFRecordConfig, async_save: bool = False) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
@@ -396,6 +483,7 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
             image_writer_processes=cfg.dataset.num_image_writer_processes,
             image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            vcodec=cfg.video_codec,
         )
 
     # Load pretrained policy
@@ -421,7 +509,14 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
     is_uf_teleop = isinstance(teleop, UFBaseTeleop)
     is_recorded = False
     key_dict = {}
-    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
+    # save_episode와 rerecord_episode는 각각 → 성공 저장, ← 실패 폐기를 뜻한다.
+    # 시간 제한에 도달했다고 자동 저장하지 않도록 두 판정 상태를 명시적으로 분리한다.
+    events = {
+        "exit_early": False,
+        "save_episode": False,
+        "rerecord_episode": False,
+        "stop_recording": False,
+    }
 
     if is_evt:
         from pynput import keyboard
@@ -434,10 +529,11 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
         def on_press(key):
             try:
                 if key == keyboard.Key.right:
-                    print("Right arrow key pressed. Exiting loop...")
+                    print("[입력] → 성공 저장을 선택했습니다.")
+                    events["save_episode"] = True
                     events["exit_early"] = True
                 elif key == keyboard.Key.left:
-                    print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                    print("[입력] ← 실패 폐기를 선택했습니다.")
                     events["rerecord_episode"] = True
                     events["exit_early"] = True
                 elif key == keyboard.Key.esc:
@@ -453,9 +549,9 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
             try:
                 if key == keyboard.Key.enter:
                     if not is_recorded:
-                        print('⌨   [ESC] Exit  [Space] Start  [←] Reset  [→] Save')
+                        print_record_controls(recording=False)
                     else:
-                        print('⌨   [ESC] Exit  [←] Reset  [→] Save')
+                        print_record_controls(recording=True)
                     # is_recorded = True
             except Exception as e:
                 print(f"Error handling key release: {e}")
@@ -464,11 +560,11 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener(events=events, on_press=on_press, on_release=on_release)
         print("\n********** Episode Record Loop Start **********")
-        print('⌨   [ESC] Exit  [Space] Start  [←] Reset  [→] Save')
+        print_record_controls(recording=False)
     else:
         input('⌨   Press Enter to start record >>> ')
-        if is_uf_teleop:
-            teleop.set_teleop_enabled(True)
+        # 실제 상대 영점 설정은 아래 공통 에피소드 시작 블록에서 팔로워
+        # 관측값과 안전 대기를 포함해 한 번만 수행합니다.
         is_recorded = True
         print('\n********** Episode Record Loop Start **********')
 
@@ -500,11 +596,41 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
 
             if is_recorded:
                 events["rerecord_episode"] = False
+                events["save_episode"] = False
                 events["exit_early"] = False
                 if is_uf_teleop:
-                    robot.configure()
+                    # 프로그램 시작/Space 직후의 자세 확인은 기존 안전 속도 3°/s입니다.
+                    # 저장 후 자동 복귀 속도 8°/s와 혼동하지 않습니다.
+                    try:
+                        robot.configure()
+                    except Exception as exc:
+                        # C31/C19 같은 컨트롤러 오류로 준비에 실패해도 프로그램을
+                        # 죽이지 않고, 오류 코드를 안내한 뒤 Space 대기로 돌아간다.
+                        is_recorded = False
+                        print(f"❌ [에피소드 시작 취소] 로봇 준비 실패: {exc}")
+                        print("   xArm 오류(C번호)가 로그에 보이면 해당 복구 절차(C31/C19)를 먼저 실행하세요.")
+                        if is_evt:
+                            print_record_controls(recording=False)
+                        continue
+                    episode_start_countdown(cfg.start_countdown_s)
                     obs = robot.get_observation()
-                    teleop.set_teleop_enabled(True, obs)
+                    try:
+                        teleop.set_teleop_enabled(True, obs)
+                    except RuntimeError as exc:
+                        # 리더가 흔들렸거나 첫 action 차이가 크면 어떤 텔레옵 명령도
+                        # 보내지 않고 다시 Space 대기 상태로 돌아갑니다.
+                        teleop.set_teleop_enabled(False)
+                        is_recorded = False
+                        print(f"❌ [에피소드 시작 취소] {exc}")
+                        print("   GELLO를 편한 자세로 잡고 고정한 뒤 Space를 다시 누르세요.")
+                        if is_evt:
+                            print_record_controls(recording=False)
+                        continue
+                # 준비/카운트다운 중에 미리 눌린 →/←는 판정 오동작을 일으키므로
+                # 녹화 시작 직전에 버린다. 판정 키는 녹화 시작 후부터 유효하다.
+                events["rerecord_episode"] = False
+                events["save_episode"] = False
+                events["exit_early"] = False
                 log_say(f"Recording episode {_current_episode_index(dataset)}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -527,29 +653,57 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
                 continue
             if events['stop_recording']:
                 break
+
+            # 20초가 끝났거나 →/←로 녹화를 멈춘 시점이다. 이 시점에는 절대
+            # 자동 저장하지 않는다. → 성공 또는 ← 실패의 명시적인 판정을 기다린다.
+            if not events["save_episode"] and not events["rerecord_episode"]:
+                wait_for_episode_decision(events, is_evt)
+            if events["stop_recording"]:
+                break
+
             if events["rerecord_episode"]:
                 log_say("Re-record episode", cfg.play_sounds)
                 events["rerecord_episode"] = False
+                events["save_episode"] = False
                 events["exit_early"] = False
                 if is_uf_teleop:
                     teleop.set_teleop_enabled(False)
                 episode_buffer = _get_episode_buffer(dataset)
-                if _episode_buffer_size(episode_buffer) > 0:
+                frame_count = _episode_buffer_size(episode_buffer)
+                episode_index = _episode_buffer_index(episode_buffer)
+                duration_s = frame_count / cfg.dataset.fps
+                if frame_count > 0:
                     if async_episode_saver is None:
                         dataset.clear_episode_buffer()
                     else:
-                        episode_index = _episode_buffer_index(episode_buffer)
                         empty_episode_buffer = _create_empty_episode_buffer(dataset, episode_index, episode_buffer)
                         _set_episode_buffer(dataset, empty_episode_buffer)
+                print("❌ [실패 에피소드 폐기 완료]")
+                print(f"   에피소드: {episode_index} / 기록 프레임: {frame_count}개 / 기록 시간: 약 {duration_s:.1f}초")
+                print("   결과: 관절값·action·영상은 학습 데이터셋에 저장하지 않았습니다.")
+                if is_uf_teleop:
+                    return_to_start_after_decision(robot, cfg, "실패 폐기")
                 is_recorded = False
                 if is_evt:
-                    print('⌨   [ESC] Exit  [Space] Start  [←] Reset  [→] Save')
+                    print_record_controls(recording=False)
                 else:
                     input('\n⌨   Press Enter to rerecord this episode >>>>> ')
                     is_recorded = True
                 continue
 
-            if is_recorded and not events['stop_recording']:
+            if events["save_episode"] and is_recorded and not events['stop_recording']:
+                # 프레임이 없는 에피소드를 저장하려 하면 LeRobot이 예외로 죽는다.
+                # 준비 단계 취소 직후 등으로 버퍼가 비어 있으면 저장을 건너뛴다.
+                empty_buffer = _episode_buffer_size(_get_episode_buffer(dataset)) == 0
+                if empty_buffer:
+                    print("⚠️ [저장 건너뜀] 기록된 프레임이 없어 이번 판정을 무시합니다. Space로 다시 시작하세요.")
+                    events["save_episode"] = False
+                    is_recorded = False
+                    if is_uf_teleop:
+                        teleop.set_teleop_enabled(False)
+                    if is_evt:
+                        print_record_controls(recording=False)
+                    continue
                 episode_index = _current_episode_index(dataset)
                 log_say(f"Save episode {episode_index}", cfg.play_sounds)
                 if is_uf_teleop:
@@ -563,9 +717,17 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
                         log_say(f"[Queued] Save episode {queued_episode_index}", cfg.play_sounds)
 
                 recorded_episodes += 1
+                # 성공 저장 또는 실패 폐기 판정 직후에만 초기 자세로 자동 복귀한다.
+                # configure()는 기본 그리퍼를 열고, 현재 자세가 시작 자세와 다를 때만
+                # 설정된 8°/s로 관절 이동을 수행한다.
+                # ESC로 전체 수집을 끝낸 경우에는 이 블록에 도달하지 않으므로
+                # 사용자가 원하지 않는 종료 직전의 추가 모션은 만들지 않는다.
+                if is_uf_teleop:
+                    return_to_start_after_decision(robot, cfg, "성공 저장")
                 is_recorded = False
+                events["save_episode"] = False
                 if is_evt:
-                    print('⌨   [ESC] Exit  [Space] Start  [←] Reset  [→] Save')
+                    print_record_controls(recording=False)
                 else:
                     input('⌨   Press Enter to record at the next episode >>>>> ')
                     is_recorded = True
@@ -590,7 +752,7 @@ def record(cfg: RecordConfig, async_save: bool = False) -> LeRobotDataset:
     return dataset
 
 @parser.wrap()
-def get_cfg(cfg: RecordConfig) -> RecordConfig:
+def get_cfg(cfg: UFRecordConfig) -> UFRecordConfig:
     return cfg
 
 def main():
