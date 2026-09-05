@@ -1,9 +1,10 @@
-> ### 이 저장소는 fork입니다
+> ### 이 저장소는 fork임
 >
 > [xArm-Developer/lerobot_robot_ufactory](https://github.com/xArm-Developer/lerobot_robot_ufactory)의
-> `e492233`에서 갈라져 나와 xArm7 텔레오퍼레이션 기능을 추가한 브랜치입니다 —
-> **14개 파일 / 1,811줄 추가.** GELLO endpoint 추적 모드, xArm7 로컬 순기구학,
-> WebXR 휴대폰 텔레옵. 무엇을 왜 바꿨는지는 **[FORK.md](FORK.md)** 에 정리했습니다.
+> `e492233`에서 갈라져 나와 xArm7 텔레오퍼레이션 기능을 추가한 브랜치임 —
+> **코드 14개 파일 / +1,811줄.** GELLO endpoint 추적 모드, xArm7 로컬 순기구학, WebXR 휴대폰
+> 텔레옵. 무엇을 왜 바꿨는지는 **[FORK.md](FORK.md)** 에 정리했음. 이 텔레옵을 실제로 운용하는
+> 워크스페이스는 **[sesepark/xarm7-pi0-teleop](https://github.com/sesepark/xarm7-pi0-teleop)** 임.
 >
 > *This is a fork. See [FORK.md](FORK.md) for the xArm7 GELLO endpoint-tracking mode, local
 > forward kinematics and WebXR phone teleoperation added on top of upstream `e492233`.
